@@ -1,2 +1,322 @@
 This is a sample application for Android NDK Advanced Tutorial that can be
 found at http://morgwai.pl/ndkTutorial/
+
+
+Android NDK Advanced Tutorial
+Using 3rd party C++ libraries with Prebuilts and standalone toolchain.
+
+Copyright 2013 Piotr Morgwai Kotarbiński
+Licensed under the Apache License, Version 2.0
+
+skip table of contents
+
+Hide table of contents
+
+    Intro
+    Prerequisites
+    Building Crypto++ with NDK toolchain
+        Preparing NDK toolchain
+        Supplying general compiler flags
+        Choosing STL version
+        Patch for Crypto++ sources
+    Creating android app project and writing Java sources
+    Writing C++ sources
+    Wiring the JNI stuff
+        Global Android.mk
+        Application.mk
+        Wiring modules
+    Checkpoint
+    Externalizing and importing modules
+    Supporting multiple STL versions
+    The End!
+
+Intro
+This documents explains some advanced use-cases of Android NDK including:
+
+    Using standalone NDK toolchain
+    Using Prebuilts feature of NDK
+    Dealing with multiple shared libs
+    Dealing with C++ STL issues
+    Importing external modules
+
+During this tutorial we will build a simple application that uses a simple native lib that in turn uses some 3rd party C++ lib. We will use Crypto++ 5.6.1 as an example.
+3rd party sources don't change as often as our working project so building them once per their release and using Prebuilts feature saves us unnecessary builds.
+As providing Android.mk replacement for each Makefile in 3rd party sources requires deep understanding of given lib's structure and may be sometimes quite challenging, it's usually easier to just replace standard GNU-GCC based toolchain with the one from Android NDK.
+Prerequisites
+
+    Android SDK r21.x or higher and basic understanding of Android platform and Android app structure
+    NDK r8d or higher and basic understanding of NDK and JNI (here is a good tutorial to learn them)
+    Eclipse IDE with ADT installed is recommended, but it is also possible to use just Apache Ant
+    Crypto++ 5.6.1 sources
+    GNU make and basic understanding of Makefiles
+    Basic knowledge of shell commands and concepts
+    This tutorial was created while working on Linux on x86, but it should be easy to "port" it to other platforms on which Android SDK is available
+
+Building Crypto++ with NDK toolchain
+Preparing NDK toolchain
+Reference docs: docs/STANDALONE-TOOLCHAIN.html
+
+First we need to prepare a toolchain for the right architecture (mips. arm, x86) and Android version. It is probably the best idea to choose the lowest version of Andy you want to support (ie the same version you put as minSdkVersion in your AndroidManifest.xml file). If you intend to support multiple devices with different archs then you will have to build Cryptopp separately for each arch. In this tutorial we will build for armv5te (referred to as 'armeabi' in Andy docs). Code for this arch can be also run on armv7-a CPUs (referred to as 'armeabi-v7a') so it covers most of Android devices.
+To the point: set and export NDK shell variable to point to the location of your NDK installation and then in your working dir issue the following command:
+
+$NDK/build/tools/make-standalone-toolchain.sh --platform=android-8 --install-dir=./ndk-toolchain
+
+Replace android-8 with the desired version for your app. Such prepared toolchain targets arm arch (both armv5te and armv7-a). If you want to prepare toolchain for another arch add --arch=mips or --arch=x86 accordingly.
+Now add ndk-toolchain folder to your path and export CXX shell var to g++ from ./ndk-toolchain/bin folder (it will be named something-something-g++).
+Supplying general compiler flags
+In case of a perfect Makefile all you should need now to cross-compile the sources of a 3rd party lib is setting the target to the desired arch, optionally setting CXXFLAGS shell vars and it should all work just by typing 'make'.
+Makefile of Crypto++ assumes that the host system is also a target, which is not our case as we are using cross-compiler and our target platform (Andy) has considerably different structure than standard Linux distro. Hence we need to change compiler options for our native host system (Linux on x86) to be those for our target system (Andy on armv5te in this example). This boils down to 2 changes in the GNUmakefile file:
+
+    switch the target architecture (-march option) from native to armv5te
+    remove linker option to use glibc pthreads (LDFLAGS += -pthread option)
+
+After applying the above changes typing make should successfully build static version of Crypto++ lib for Andy. To build a shared version type make libcryptopp.so
+Choosing STL version
+Reference docs: docs/STANDALONE-TOOLCHAIN.html, docs/CPLUSPLUS-SUPPORT.html
+
+By default NDK toolchain will link your C++ shared libs against a static version of GNU STL lib. However if you are using several shared libs it is not acceptable to link against the static version of STL as each of your shared lib will have its own copy of STL. This will result in several copies of global vars defined in STL and may lead to memory leak or corruption. To use the shared version of STL you just need to add -lgnustl_shared linker option:
+
+LDLIBS += -lgnustl_shared
+
+Also neither LDFLAGS nor LDLIBS var is originally used in the command that builds shared library in the GNUmakefile file so you need to append it at its end like this:
+
+libcryptopp.so: $(LIBOBJS)
+  $(CXX) -shared -o $@ $(LIBOBJS) $(LDFLAGS) $(LDLIBS)
+
+
+GNU STL is distributed under GPLv3 license which is not acceptable for some people. NDK provides also STLport and it is possible to use it instead, but it is a bit more complicated as standalone toolchain does not include it and there are some bugs in NDK that you need to workaround until the next version is released.
+
+The bugs are 52805, 52833 and 52835. In case of the first two of them you should download the patches that fix them and apply them to your NDK. After that download both of the two files changed in the patch for the third one (build-stlport.sh and builder-funcs.sh) and replace the files in your NDK with them.
+Next you need to rebuild Gabi++ and STLport libs of your NDK: go to the ${NDK}/build/tools folder and type the below commands:
+
+./build-gabi++.sh
+
+and then
+
+./build-stlport.sh
+
+Now your NDK is ready to rock ;)
+
+The next thing to do is to point the compiler to the right header files and linker to the location of the STLport lib: in the GNUmakefile define the LDFLAGS, LDLIBS and CXXFLAGS vars like this:
+
+CXXFLAGS += -nostdinc++ -I$(NDK)/sources/cxx-stl/stlport/stlport
+LDFLAGS += -L$(NDK)/sources/cxx-stl/stlport/libs/armeabi
+LDLIBS += -lstlport_shared -lc -lm -ldl -lgcc
+
+If you are building for different arch than armeabi you need to change the path in LDFLAGS accordingly.
+-nostdinc++ tells the compiler not to include stdlib++ header files which belong to gnustl in our case. The -I flag points the compiler to the header files for STLport.
+-nodefaultlibs tells the linker not to link against standard C and C++ and compiler libs that may belog to gnustl: it will link only against the platform minimal C runtime (crt* stuff) and the libraries specified by -l flags.
+In LDLIBS we specify that the linker should include STLport, libc and the compiler stuff.
+
+The last problem is that Crypto++ seems to rely on implicit inclusion of header file containing definition of fd_set. This is not the case when using STLport so you need to add the following preprocessor command somewhere in wait.h file:
+
+#include <sys/select.h>
+
+Patch for Crypto++ sources
+Below is the patch for Crypto++ sources with all the changes described above.
+
+DISCLAIMER:
+Described changes to the Crypto++'s GNUmakefile are UGLY HACKS just to make it work ASAP and are DEFINITELY NOT A GOOD EXAMPLE HOW TO WRITE MAKEFILES in general. For example you should generally introduce a notion of a target platform rather than putting options for it into the host platform.
+
+diff -r -u cryptopp-orig/GNUmakefile cryptopp-andy.armeabi.stlport/GNUmakefile
+--- cryptopp-orig/GNUmakefile	2010-08-09 14:22:42.000000000 +0200
++++ cryptopp-andy.armeabi.stlport/GNUmakefile	2013-03-09 19:17:12.934327979 +0100
+@@ -37,7 +37,7 @@
+ ifeq ($(UNAME),Darwin)
+ CXXFLAGS += -arch x86_64 -arch i386
+ else
+-CXXFLAGS += -march=native
++CXXFLAGS += -march=armv5te
+ endif
+ endif
+ 
+@@ -78,7 +78,12 @@
+ endif
+ 
+ ifeq ($(UNAME),Linux)
+-LDFLAGS += -pthread
++## uncomment the below line to use GNU STL
++#LDLIBS += -lgnustl_shared
++## uncomment the below 3 lines to use STLport
++LDFLAGS += -nodefaultlibs -L$(NDK)/sources/cxx-stl/stlport/libs/armeabi -Wl,--no-undefined
++LDLIBS += -lstlport_shared -lc -lm -ldl -lgcc
++CXXFLAGS += -nostdinc++ -I$(NDK)/sources/cxx-stl/stlport/stlport
+ ifneq ($(shell uname -i | $(EGREP) -c "(_64|d64)"),0)
+ M32OR64 = -m64
+ endif
+@@ -151,7 +156,7 @@
+ 	$(RANLIB) $@
+ 
+ libcryptopp.so: $(LIBOBJS)
+-	$(CXX) -shared -o $@ $(LIBOBJS)
++	$(CXX) -shared -o $@ $(LIBOBJS) $(LDFLAGS) $(LDLIBS)
+ 
+ cryptest.exe: libcryptopp.a $(TESTOBJS)
+ 	$(CXX) -o $@ $(CXXFLAGS) $(TESTOBJS) -L. -lcryptopp $(LDFLAGS) $(LDLIBS)
+diff -r -u cryptopp-orig/wait.h cryptopp-andy.armeabi.stlport/wait.h
+--- cryptopp-orig/wait.h	2010-08-06 18:44:32.000000000 +0200
++++ cryptopp-andy.armeabi.stlport/wait.h	2013-03-08 15:50:01.758533453 +0100
+@@ -13,6 +13,7 @@
+ #include <winsock2.h>
+ #else
+ #include <sys/types.h>
++#include <sys/select.h>
+ #endif
+ 
+ #include "hrtimer.h"
+
+Creating android app project and writing Java sources
+Reference docs: docs/CPLUSPLUS-SUPPORT.html
+
+Let's create a standard android app project and our main activity will just display a return value from a native method. Create a class named Native that will be responsible for loading native libs and will contain the native method. Libs have to be loaded in the order of their dependencies, ie if liba.so depends on libb.so you first need to load libb.so and then liba.so. Thus you need to start from loading the STL lib you decided to use, then load Crypto++, and finally our small lib that uses it (let's call it libcrypt_user.so)
+
+package pl.morgwai.ndktutorial;
+
+public class Native {
+
+	static {
+		System.loadLibrary("stlport_shared");
+		//System.loadLibrary("gnustl_shared");
+		System.loadLibrary("cryptopp");
+		System.loadLibrary("crypt_user");
+	}
+
+	public native long fun(int i);
+}
+
+Writing C++ sources
+To avoid mistakes in JNI function names that result in mysterious 'Unsatisfied link' exception you can generate them automatically with javah tool: go to the bin/classes subfolder of your app project folder and run javah with the fully qualified name of your Native class as an argument:
+javah pl.morgwai.ndktutorial.Native
+This tool generates 'classic' JNI headers. On the other hand Android NDK seems not use macros JNIEXPORT and JNICALL: most of the sample apps from NDK don't use them and Eclipse ADT marks them as errors. To strip them you can use the below sed command:
+
+sed -e 's#JNIEXPORT##' < pl_morgwai_ndktutorial_Native.h | sed -e 's#JNICALL##' >native.h
+
+Now you can include native.h file in your sources or just copy the relevant part from it.
+If don't want to use javah tool remember to put your function or its header in extern "C" braces.
+Now let's create the implementation of the function in file named crypt_user.cpp. Inside the implementation just use some global var from Crypto++:
+
+#include <jni.h>
+#include <cryptlib.h>
+
+extern "C" {
+jlong Java_pl_morgwai_ndktutorial_Native_fun
+    (JNIEnv* env, jobject o, jint i) {
+  long long t = CryptoPP::INFINITE_TIME / i;
+  return t;
+}
+}
+
+Wiring the JNI stuff
+Hint: if you encounter problems during this stage do clean your project manually by deleting folders bin and obj and all arch specific result subfolders from lib folder. Few times I myself have lost several hours because of stale objects lying there around.
+Global Android.mk
+Reference docs: docs/OVERVIEW.html
+
+Each shared lib will have its own subfolder and Android.mk file so the main Android.mk file from the jni folder just needs to include them:
+
+include $(call all-subdir-makefiles)
+
+Application.mk
+Reference docs: docs/APPLICATION-MK.html
+
+We also need to specify some global stuff in Application.mk file in the jni folder:
+
+APP_ABI := armeabi
+APP_CPPFLAGS += -fexceptions -frtti
+APP_STL := stlport_shared
+#APP_STL := gnustl_shared
+
+APP_ABI specifies the arch(s) which our libs should be built for. If you want to build apk for multiple archs enumerate them all separated by space. For example APP_ABI := armeabi armeabi-v7a x86 mips
+APP_CPPFLAGS specifies CXXFLAGS to be used by NDK when building your shared libs. By default NDK compiles CPP sources without exception nor RTTI support. As we are using STL version that uses them we need to turn them on here. (Contrary to this, the standalone toolchain has exception and RTTI support turned on by default)
+APP_STL specifies which version of STL to include in your apk.
+Wiring modules
+Reference docs: docs/PREBUILTS.html, docs/ANDROID-MK.html
+
+Now create a subfolder cryptopp in the jni folder. Inside it create subfolders named after each arch you want to build your shared libs for. Place your prebuilt libcryptopp.so files in them accordingly. Next to them (ie inside cryptopp folder) create a subfolder named include and place there all header files that you may need to include in the sources of your libs that use this prebuilt lib. In case of Crypto++ just copy all header files (*.h) from its source folder.
+Finally create Android.mk file inside the cryptopp folder:
+
+LOCAL_PATH:= $(call my-dir)
+
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := cryptopp
+LOCAL_SRC_FILES := $(TARGET_ARCH_ABI)/libcryptopp.so
+LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH)/include
+
+include $(PREBUILT_SHARED_LIBRARY)
+
+The last line says that this module is a prebuilt shared library and the LOCAL_SRC_FILES points to the location of its binary. The TARGET_ARCH_ABI var will be substituted accordingly during the build process for the given arch.
+LOCAL_EXPORT_C_INCLUDES specifies the location of header files for other libs that use this one.
+
+
+The last step is to create subfolder named crypt_user, placing there the source file of our small cpp lib (crypt_user.cpp) we created previously and creating Android.mk file for it:
+
+LOCAL_PATH:= $(call my-dir)
+
+include $(CLEAR_VARS)
+
+LOCAL_MODULE    := crypt_user
+LOCAL_SRC_FILES := crypt_user.cpp
+LOCAL_SHARED_LIBRARIES := cryptopp
+
+include $(BUILD_SHARED_LIBRARY)
+
+LOCAL_SHARED_LIBRARIES specifies other shared lib modules this module depends on so NDK knows where to find include files and what to link against.
+Checkpoint
+Your app should work fine now. In case of problems you can try to see a reference sample app for this tutorial at github.
+Externalizing and importing modules
+Reference docs: docs/IMPORT-MODULE.html
+
+If you intend to use your prebuilt lib (or any other module) in several project it makes sense to define it as an external module and reuse it in any project that needs it.
+Define env var NDK_MODULE_PATH to contain a path somewhere outside of your app project tree: you will store your external modules there. Next move cryptopp subfolder of jni folder there. In the main Android.mk file from jni folder append the following line at the end:
+
+$(call import-module,cryptopp)
+
+The second argument cryptopp must correspond to the subfolder name of your external module in NDK_MODULE_PATH folder. Inside its Android.mk file you can actually define several modules that you can later use as LOCAL_SHARED_LIBRARIES or LOCAL_STATIC_LIBRARIES in your projects. None of them has to be named after the subfolder name.
+
+Since Crypto++ relies on RTTI and exception support it's a good idea to export appropriate flags to all users of this module: add the following line before PREBUILT_SHARED_LIBRARY in cryptopp module's Android.mk file:
+
+LOCAL_EXPORT_CPPFLAGS := -fexceptions -frtti
+
+As our only 'local' module crypt_user does not depend on these flags directly anymore, you can safely remove APPAPP_CPPFLAGS line from your Application.mk file. crypt_user needs to be compiled with these flags as well to be properly linked with cryptopp, but they will be imported for him thanks to the declared dependency in LOCAL_SHARED_LIBRARIES in its Android.mk file.
+
+You can see it working in import-module branch of the reference app git repo.
+Supporting multiple STL versions
+Different projects may need to use different STL versions. That's why when you provide prebuilt lib as an external module it's a good idea to provide binaries for each STL version that may be needed.
+Inside your cryptopp create subfolders named after STL versions, for example stlport_shared and gnustl_shared and inside them create subfolders for supported archs and place prebuilt binaries there. Now change the definition of LOCAL_SRC_FILES in Android.mk file to look like this:
+
+LOCAL_SRC_FILES := $(APP_STL)/$(TARGET_ARCH_ABI)/libcryptopp.so
+
+Sometimes even a single app may need to have different builts with different STL versions. There's a small problem here that in such case you don't know which lib to load in your java code. The solution is simply to try to load all of them and catch the error when the wrong ones fail. Our Native class would look like this:
+
+package pl.morgwai.ndktutorial;
+
+import android.util.Log;
+
+public class Native {
+
+	public static final String LOG_TAG = Native.class.getSimpleName();
+
+	static {
+		try {
+			System.loadLibrary("stlport_shared");
+		} catch (UnsatisfiedLinkError e) {
+			Log.i(LOG_TAG, "stlport not found");
+		}
+		try {
+			System.loadLibrary("gnustl_shared");
+		} catch (UnsatisfiedLinkError e) {
+			Log.i(LOG_TAG, "gnustl not found");
+		}
+		System.loadLibrary("cryptopp");
+		System.loadLibrary("crypt_user");
+	}
+
+	public native long fun(int i);
+}
+
+Now it will all work just by changing APP_STL var in the Application.mk file.
+
+In case of problems you can refer to multiple-stl branch of the reference app.
+The End!
+That's it. Hope this tutorial was useful for you :)
+Feedback is welcome of course. 
